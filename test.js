@@ -12,20 +12,15 @@ const TARGET = 'https://chatgpt.com';
 const MY_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 // ----------------------------------------------------------------------
-// 1. PROXY CONFIGURATION (FIXED FOR WEBSHARE)
+// 1. PROXY CONFIGURATION (THE FIX)
 // ----------------------------------------------------------------------
 const PROXY_SERVER_URL = process.env.PROXY_URL; 
 
+// We MUST add 'rejectUnauthorized: false' or Node.js will drop the connection
 const proxyAgent = PROXY_SERVER_URL ? new HttpsProxyAgent(PROXY_SERVER_URL, {
-    // FIX 1: Disable KeepAlive. 
-    // Webshare hates persistent connections and will hang up if you hold them too long.
-    keepAlive: false, 
-    
-    // FIX 2: Ignore SSL errors from the proxy
-    rejectUnauthorized: false,
-    
-    // FIX 3: Longer timeout to handle slow residential IPs
-    timeout: 30000 
+    rejectUnauthorized: false, 
+    keepAlive: true,
+    timeout: 10000 
 }) : null;
 
 if (proxyAgent) {
@@ -33,13 +28,14 @@ if (proxyAgent) {
 }
 
 // ----------------------------------------------------------------------
-// 2. COOKIE SETUP
+// 2. COOKIE CONFIGURATION
 // ----------------------------------------------------------------------
 const MY_COOKIE_VALUE = process.env.COOKIES;
 if (!MY_COOKIE_VALUE) {
     console.error("CRITICAL ERROR: 'COOKIES' environment variable is missing!");
     process.exit(1);
 }
+// Ensure we handle both cases: if user pasted full token or just value
 const MY_COOKIE = MY_COOKIE_VALUE.startsWith('__Secure') 
     ? MY_COOKIE_VALUE 
     : `__Secure-next-auth.session-token=${MY_COOKIE_VALUE}`;
@@ -50,31 +46,29 @@ const MY_COOKIE = MY_COOKIE_VALUE.startsWith('__Secure')
 const proxyMiddleware = createProxyMiddleware({
     target: TARGET,
     changeOrigin: true,
-    agent: proxyAgent, 
+    agent: proxyAgent, // Apply the fixed agent
     cookieDomainRewrite: { "*": "" },
     followRedirects: false,
 
     on: {
         proxyReq: (proxyReq, req, res) => {
+            // Safety check
             if (proxyReq.destroyed) return;
 
             try {
+                // Strip Identity
                 proxyReq.removeHeader('Cookie');
                 proxyReq.removeHeader('User-Agent');
                 proxyReq.removeHeader('x-forwarded-for');
-                proxyReq.removeHeader('x-real-ip');
-
+                
+                // Inject Identity
                 proxyReq.setHeader('User-Agent', MY_USER_AGENT);
                 proxyReq.setHeader('Cookie', MY_COOKIE);
                 proxyReq.setHeader('Origin', TARGET);
                 proxyReq.setHeader('Referer', TARGET + '/'); 
                 
-                // IMPORTANT: Tell Cloudflare we don't want compression 
-                // (Helps prevent weird hanging on large files)
-                proxyReq.setHeader('Accept-Encoding', 'identity'); 
-
             } catch (err) {
-                // Ignore header errors if proxy died
+                console.error("Header injection warning:", err.message);
             }
 
             if (req.url.includes('/backend-api/conversation')) {
@@ -83,6 +77,7 @@ const proxyMiddleware = createProxyMiddleware({
         },
         
         proxyRes: (proxyRes, req, res) => {
+            // Clean up headers to prevent browser errors
             delete proxyRes.headers['content-security-policy'];
             delete proxyRes.headers['content-security-policy-report-only'];
             delete proxyRes.headers['x-frame-options'];
@@ -91,24 +86,9 @@ const proxyMiddleware = createProxyMiddleware({
         },
 
         error: (err, req, res) => {
-            // FIX 4: SILENT ERROR HANDLING
-            // If the proxy hangs up on 1 image out of 50, don't crash the server.
-            // Just log it and send a 504 to the browser for that specific file.
-            
-            if (err.code === 'ECONNRESET' || err.message.includes('hang up')) {
-                 console.log(`[Proxy Warning] Dropped connection for ${req.url}`);
-            } else {
-                 console.error('Proxy Error:', err.message);
-            }
-
-            // Only send a response if we haven't already
+            console.error('Proxy Connection Error:', err.message);
             if (!res.headersSent) {
-                try {
-                    res.writeHead(504, { 'Content-Type': 'text/plain' });
-                    res.end('Proxy Timeout');
-                } catch (e) {
-                    // Ignore writing errors
-                }
+                res.status(502).send("Proxy Error: The residential proxy failed to connect.");
             }
         }
     }
@@ -116,10 +96,9 @@ const proxyMiddleware = createProxyMiddleware({
 
 app.use('/', proxyMiddleware);
 
-// FIX 5: Prevent server from crashing on unhandled socket errors
+// Global crash prevention
 process.on('uncaughtException', (err) => {
-    if (err.code === 'ERR_HTTP_HEADERS_SENT') return; // Ignore these
-    console.error('CRITICAL UNCAUGHT ERROR (Kept Alive):', err.message);
+    console.error('CRITICAL UNCAUGHT ERROR (Server kept running):', err.message);
 });
 
 app.listen(PORT, () => {
