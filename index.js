@@ -2,13 +2,19 @@ import express from "express";
 import { createProxyMiddleware } from "http-proxy-middleware";
 import cors from "cors";
 import dotenv from 'dotenv';
+import zlib from 'zlib';
+import https from 'https'; // <--- NEW IMPORT
+import fs from 'fs';       // <--- NEW IMPORT
 
 dotenv.config();
 
 const app = express();
 const TARGET = 'https://chatgpt.com';
 
-const MY_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36';
+// !!! NOTE: HTTPS !!!
+const MY_PROXY_URL = 'https://192.168.10.42:3000'; 
+
+const MY_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36';
 
 const MY_COOKIE = [
     process.env.AUTH_TOKEN, 
@@ -16,37 +22,23 @@ const MY_COOKIE = [
     process.env.CF_COOKIE
 ].filter(Boolean).join('; ');
 
-// --- STARTUP LOG ---
-console.log("\n\n");
 console.log("##################################################");
-console.log("## SERVER STARTED - WATCH THIS TERMINAL FOR LOGS ##");
+console.log(`## SECURE PROXY RUNNING ON: ${MY_PROXY_URL}`);
 console.log("##################################################");
-console.log("Cookie Length:", MY_COOKIE.length);
-console.log("\n");
 
-app.use(cors({
-    origin: true, 
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'x-requested-with', '*']
-}));
-
-const MY_PROXY_URL = 'https://resonantly-creatable-santana.ngrok-free.dev'; // <--- PUT YOUR NGROK URL HERE
+app.use(cors({ origin: true, credentials: true }));
 
 const proxyMiddleware = createProxyMiddleware({
     target: TARGET,
     changeOrigin: true,
-    selfHandleResponse: true, // <--- IMPORTANT: Allows us to modify the body
+    selfHandleResponse: true,
     ws: true,
-    secure: false,
+    secure: false, // Ignore ChatGPT's cert errors (we trust them)
     cookieDomainRewrite: "*",
     
     on: {
         proxyReq: (proxyReq, req, res) => {
-            // 1. Force server to send plain text (so we can read/edit it)
-            proxyReq.setHeader('Accept-Encoding', 'identity');
-            
-            // Standard spoofing
+            proxyReq.setHeader('Accept-Encoding', 'gzip, deflate');
             proxyReq.setHeader('Host', 'chatgpt.com');
             proxyReq.setHeader('Origin', 'https://chatgpt.com');
             proxyReq.setHeader('Referer', 'https://chatgpt.com/');
@@ -55,51 +47,88 @@ const proxyMiddleware = createProxyMiddleware({
         },
 
         proxyRes: (proxyRes, req, res) => {
-            // Copy status code
             res.statusCode = proxyRes.statusCode;
 
-            // Copy headers (excluding ones we might break by changing body size)
+            // 1. STRIP SECURITY HEADERS (CSP)
             Object.keys(proxyRes.headers).forEach(key => {
-                if (key !== 'content-length' && key !== 'transfer-encoding') {
+                const k = key.toLowerCase();
+                if (
+                    k !== 'content-security-policy' && 
+                    k !== 'content-security-policy-report-only' &&
+                    k !== 'strict-transport-security' && 
+                    k !== 'content-encoding' && 
+                    k !== 'content-length' &&
+                    k !== 'transfer-encoding' &&
+                    k !== 'set-cookie'
+                ) {
                     res.setHeader(key, proxyRes.headers[key]);
                 }
             });
 
-            // Force CORS on the response
-            res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
-            res.setHeader('Access-Control-Allow-Credentials', 'true');
+            // 2. COOKIE LOGIC (HTTPS VERSION)
+            // Since we are on HTTPS, we WANT "Secure".
+            // We just need to remove the Domain so it sticks to our IP.
+            if (proxyRes.headers['set-cookie']) {
+                const cookies = proxyRes.headers['set-cookie'].map(c => {
+                    let newCookie = c.replace(/; Domain=[^;]+/, '');
+                    
+                    // ENSURE SECURE IS PRESENT
+                    if (!newCookie.includes('; Secure')) {
+                        newCookie += '; Secure';
+                    }
+                    
+                    // ENSURE SAMESITE=NONE (Allows cross-origin usage if needed)
+                    // Note: SameSite=None REQUIRED Secure, which we now have!
+                    newCookie = newCookie.replace(/; SameSite=[^;]+/, '') + '; SameSite=None';
+                    
+                    return newCookie;
+                });
+                res.setHeader('set-cookie', cookies);
+            }
 
-            // --- BODY REWRITING LOGIC ---
+            // 3. BODY REWRITING
             let bodyChunks = [];
-            
-            proxyRes.on('data', (chunk) => {
-                bodyChunks.push(chunk);
-            });
+            proxyRes.on('data', (chunk) => bodyChunks.push(chunk));
 
             proxyRes.on('end', () => {
-                let body = Buffer.concat(bodyChunks).toString('utf8');
-
-                // ONLY REWRITE IF IT'S TEXT/HTML or JS
+                const buffer = Buffer.concat(bodyChunks);
+                const encoding = proxyRes.headers['content-encoding'];
                 const contentType = proxyRes.headers['content-type'] || '';
+
+                const processBody = (str) => {
+                    // Replace https://chatgpt.com -> https://192.168...
+                    let newBody = str.replace(/https:\/\/chatgpt\.com/g, MY_PROXY_URL);
+                    newBody = newBody.replace(/https:\\\/\\\/chatgpt\.com/g, MY_PROXY_URL);
+                    // Strip Integrity checks
+                    newBody = newBody.replace(/integrity="[^"]*"/g, '');
+                    return newBody;
+                };
+
                 if (contentType.includes('text') || contentType.includes('javascript') || contentType.includes('json')) {
-                    
-                    console.log(`[REWRITE] Modifying content for ${req.url}`);
-
-                    // 1. Replace the hardcoded domain with your proxy domain
-                    // This creates a global regex to replace all instances
-                    const regex = new RegExp('https://chatgpt.com', 'g');
-                    body = body.replace(regex, MY_PROXY_URL);
-                    
-                    // 2. Also replace encoded versions just in case (optional but safe)
-                    // body = body.replace(/https:\\\/\\\/chatgpt\.com/g, MY_PROXY_URL);
+                    try {
+                        if (encoding === 'gzip') {
+                            zlib.gunzip(buffer, (err, decoded) => {
+                                if (err) return res.end(buffer);
+                                res.end(processBody(decoded.toString('utf8')));
+                            });
+                        } else if (encoding === 'br') {
+                            zlib.brotliDecompress(buffer, (err, decoded) => {
+                                if (err) return res.end(buffer);
+                                res.end(processBody(decoded.toString('utf8')));
+                            });
+                        } else {
+                            res.end(processBody(buffer.toString('utf8')));
+                        }
+                    } catch (e) {
+                        res.end(buffer);
+                    }
+                } else {
+                    res.end(buffer);
                 }
-
-                res.end(body);
             });
         },
-        
         error: (err, req, res) => {
-            console.error('   !!! PROXY ERROR:', err.message);
+            console.error('PROX_ERR:', err.message);
             if(!res.headersSent) res.end();
         }
     }
@@ -107,6 +136,17 @@ const proxyMiddleware = createProxyMiddleware({
 
 app.use('/', proxyMiddleware);
 
-app.listen(3000, () => {
-    console.log('Server Ready on port 3000...');
-});
+// --- LOAD CERTIFICATES AND START HTTPS SERVER ---
+try {
+    const httpsOptions = {
+        key: fs.readFileSync('./key.pem'),
+        cert: fs.readFileSync('./cert.pem')
+    };
+
+    https.createServer(httpsOptions, app).listen(3000, '0.0.0.0', () => {
+        console.log(`HTTPS Server Ready! https://192.168.10.42:3000`);
+    });
+} catch (error) {
+    console.error("FAILED TO LOAD CERTIFICATES. Did you run step 1?");
+    console.error(error.message);
+}
