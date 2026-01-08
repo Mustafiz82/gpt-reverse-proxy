@@ -1,127 +1,112 @@
 import express from "express";
 import { createProxyMiddleware } from "http-proxy-middleware";
-import { HttpsProxyAgent } from "https-proxy-agent"; 
+import cors from "cors";
 import dotenv from 'dotenv';
 
 dotenv.config();
 
 const app = express();
-
-const PORT = process.env.PORT || 3000;
 const TARGET = 'https://chatgpt.com';
-const MY_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-// ----------------------------------------------------------------------
-// 1. PROXY CONFIGURATION (FIXED FOR WEBSHARE)
-// ----------------------------------------------------------------------
-const PROXY_SERVER_URL = process.env.PROXY_URL; 
+const MY_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36';
 
-const proxyAgent = PROXY_SERVER_URL ? new HttpsProxyAgent(PROXY_SERVER_URL, {
-    // FIX 1: Disable KeepAlive. 
-    // Webshare hates persistent connections and will hang up if you hold them too long.
-    keepAlive: false, 
-    
-    // FIX 2: Ignore SSL errors from the proxy
-    rejectUnauthorized: false,
-    
-    // FIX 3: Longer timeout to handle slow residential IPs
-    timeout: 30000 
-}) : null;
+const MY_COOKIE = [
+    process.env.AUTH_TOKEN, 
+    process.env.DEVICE_ID, 
+    process.env.CF_COOKIE
+].filter(Boolean).join('; ');
 
-if (proxyAgent) {
-    console.log(`[System] Using Proxy Agent: ${PROXY_SERVER_URL.replace(/:[^:]*@/, ':****@')}`);
-}
+// --- STARTUP LOG ---
+console.log("\n\n");
+console.log("##################################################");
+console.log("## SERVER STARTED - WATCH THIS TERMINAL FOR LOGS ##");
+console.log("##################################################");
+console.log("Cookie Length:", MY_COOKIE.length);
+console.log("\n");
 
-// ----------------------------------------------------------------------
-// 2. COOKIE SETUP
-// ----------------------------------------------------------------------
-const MY_COOKIE_VALUE = process.env.COOKIES;
-if (!MY_COOKIE_VALUE) {
-    console.error("CRITICAL ERROR: 'COOKIES' environment variable is missing!");
-    process.exit(1);
-}
-const MY_COOKIE = MY_COOKIE_VALUE.startsWith('__Secure') 
-    ? MY_COOKIE_VALUE 
-    : `__Secure-next-auth.session-token=${MY_COOKIE_VALUE}`;
+app.use(cors({
+    origin: true, 
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-requested-with', '*']
+}));
 
-// ----------------------------------------------------------------------
-// 3. MIDDLEWARE
-// ----------------------------------------------------------------------
+const MY_PROXY_URL = 'https://resonantly-creatable-santana.ngrok-free.dev'; // <--- PUT YOUR NGROK URL HERE
+
 const proxyMiddleware = createProxyMiddleware({
     target: TARGET,
     changeOrigin: true,
-    agent: proxyAgent, 
-    cookieDomainRewrite: { "*": "" },
-    followRedirects: false,
-
+    selfHandleResponse: true, // <--- IMPORTANT: Allows us to modify the body
+    ws: true,
+    secure: false,
+    cookieDomainRewrite: "*",
+    
     on: {
         proxyReq: (proxyReq, req, res) => {
-            if (proxyReq.destroyed) return;
+            // 1. Force server to send plain text (so we can read/edit it)
+            proxyReq.setHeader('Accept-Encoding', 'identity');
+            
+            // Standard spoofing
+            proxyReq.setHeader('Host', 'chatgpt.com');
+            proxyReq.setHeader('Origin', 'https://chatgpt.com');
+            proxyReq.setHeader('Referer', 'https://chatgpt.com/');
+            proxyReq.setHeader('User-Agent', MY_USER_AGENT);
+            proxyReq.setHeader('Cookie', MY_COOKIE);
+        },
 
-            try {
-                proxyReq.removeHeader('Cookie');
-                proxyReq.removeHeader('User-Agent');
-                proxyReq.removeHeader('x-forwarded-for');
-                proxyReq.removeHeader('x-real-ip');
+        proxyRes: (proxyRes, req, res) => {
+            // Copy status code
+            res.statusCode = proxyRes.statusCode;
 
-                proxyReq.setHeader('User-Agent', MY_USER_AGENT);
-                proxyReq.setHeader('Cookie', MY_COOKIE);
-                proxyReq.setHeader('Origin', TARGET);
-                proxyReq.setHeader('Referer', TARGET + '/'); 
-                
-                // IMPORTANT: Tell Cloudflare we don't want compression 
-                // (Helps prevent weird hanging on large files)
-                proxyReq.setHeader('Accept-Encoding', 'identity'); 
+            // Copy headers (excluding ones we might break by changing body size)
+            Object.keys(proxyRes.headers).forEach(key => {
+                if (key !== 'content-length' && key !== 'transfer-encoding') {
+                    res.setHeader(key, proxyRes.headers[key]);
+                }
+            });
 
-            } catch (err) {
-                // Ignore header errors if proxy died
-            }
+            // Force CORS on the response
+            res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
+            res.setHeader('Access-Control-Allow-Credentials', 'true');
 
-            if (req.url.includes('/backend-api/conversation')) {
-                console.log(`[Injecting] Spoofing chat request...`);
-            }
+            // --- BODY REWRITING LOGIC ---
+            let bodyChunks = [];
+            
+            proxyRes.on('data', (chunk) => {
+                bodyChunks.push(chunk);
+            });
+
+            proxyRes.on('end', () => {
+                let body = Buffer.concat(bodyChunks).toString('utf8');
+
+                // ONLY REWRITE IF IT'S TEXT/HTML or JS
+                const contentType = proxyRes.headers['content-type'] || '';
+                if (contentType.includes('text') || contentType.includes('javascript') || contentType.includes('json')) {
+                    
+                    console.log(`[REWRITE] Modifying content for ${req.url}`);
+
+                    // 1. Replace the hardcoded domain with your proxy domain
+                    // This creates a global regex to replace all instances
+                    const regex = new RegExp('https://chatgpt.com', 'g');
+                    body = body.replace(regex, MY_PROXY_URL);
+                    
+                    // 2. Also replace encoded versions just in case (optional but safe)
+                    // body = body.replace(/https:\\\/\\\/chatgpt\.com/g, MY_PROXY_URL);
+                }
+
+                res.end(body);
+            });
         },
         
-        proxyRes: (proxyRes, req, res) => {
-            delete proxyRes.headers['content-security-policy'];
-            delete proxyRes.headers['content-security-policy-report-only'];
-            delete proxyRes.headers['x-frame-options'];
-            delete proxyRes.headers['strict-transport-security'];
-            proxyRes.headers['access-control-allow-origin'] = '*';
-        },
-
         error: (err, req, res) => {
-            // FIX 4: SILENT ERROR HANDLING
-            // If the proxy hangs up on 1 image out of 50, don't crash the server.
-            // Just log it and send a 504 to the browser for that specific file.
-            
-            if (err.code === 'ECONNRESET' || err.message.includes('hang up')) {
-                 console.log(`[Proxy Warning] Dropped connection for ${req.url}`);
-            } else {
-                 console.error('Proxy Error:', err.message);
-            }
-
-            // Only send a response if we haven't already
-            if (!res.headersSent) {
-                try {
-                    res.writeHead(504, { 'Content-Type': 'text/plain' });
-                    res.end('Proxy Timeout');
-                } catch (e) {
-                    // Ignore writing errors
-                }
-            }
+            console.error('   !!! PROXY ERROR:', err.message);
+            if(!res.headersSent) res.end();
         }
     }
 });
 
 app.use('/', proxyMiddleware);
 
-// FIX 5: Prevent server from crashing on unhandled socket errors
-process.on('uncaughtException', (err) => {
-    if (err.code === 'ERR_HTTP_HEADERS_SENT') return; // Ignore these
-    console.error('CRITICAL UNCAUGHT ERROR (Kept Alive):', err.message);
-});
-
-app.listen(PORT, () => {
-    console.log(`Proxy running on port ${PORT}`);
+app.listen(3000, () => {
+    console.log('Server Ready on port 3000...');
 });
