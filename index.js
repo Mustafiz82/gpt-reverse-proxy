@@ -5,44 +5,41 @@ import dotenv from 'dotenv';
 import zlib from 'zlib';
 import https from 'https';
 import fs from 'fs';
-import { Transform } from 'stream'; // <--- NEW: Required for streaming
+import { Transform } from 'stream'; 
 
 dotenv.config();
 
 const app = express();
 const TARGET = 'https://chatgpt.com';
 
-// !!! HTTPS URL !!!
-const MY_PROXY_URL = 'https://192.168.10.42:3000'; 
+// Configuration from .env
+const MY_IP = process.env.MY_IP || '192.168.10.42';
+const MY_PROXY_URL = `https://${MY_IP}:3000`; 
+const MY_COOKIE = process.env.CHATGPT_COOKIES;
 
+// Consistency: This must match the browser you took the cookies from
 const MY_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36';
 
-const MY_COOKIE = [
-    process.env.AUTH_TOKEN, 
-    process.env.DEVICE_ID, 
-    process.env.CF_COOKIE
-].filter(Boolean).join('; ');
-
 console.log("##################################################");
-console.log(`## SECURE PROXY RUNNING ON: ${MY_PROXY_URL}`);
+console.log(`## PROXY STARTING ON: ${MY_PROXY_URL}`);
+console.log(`## COOKIE LOADED: ${MY_COOKIE ? MY_COOKIE.substring(0, 30) + "..." : "MISSING!"}`);
 console.log("##################################################");
 
 app.use(cors({ origin: true, credentials: true }));
 
-// --- HELPER FUNCTION: URL REWRITER ---
-// This handles both HTTPS and WSS (WebSocket) replacements
+// --- HELPER: URL REWRITER ---
 const replaceUrls = (str) => {
+    if (!str) return str;
     // 1. Replace Standard HTTPS URLs
     let newBody = str.replace(/https:\/\/chatgpt\.com/g, MY_PROXY_URL);
     newBody = newBody.replace(/https:\\\/\\\/chatgpt\.com/g, MY_PROXY_URL);
     
-    // 2. Replace WebSocket (WSS) URLs (CRITICAL FOR CHAT)
-    // We convert wss://chatgpt.com -> wss://192.168.10.42:3000
+    // 2. Replace WebSocket (WSS) URLs (Critical for Chat response)
     const myWssUrl = MY_PROXY_URL.replace('https://', 'wss://');
     newBody = newBody.replace(/wss:\/\/chatgpt\.com/g, myWssUrl);
     newBody = newBody.replace(/wss:\\\/\\\/chatgpt\.com/g, myWssUrl);
 
-    // 3. Strip Integrity Checks (Prevents browser from blocking modified scripts)
+    // 3. Strip Integrity Checks (Prevents script blocking)
     newBody = newBody.replace(/integrity="[^"]*"/g, '');
     
     return newBody;
@@ -51,43 +48,50 @@ const replaceUrls = (str) => {
 const proxyMiddleware = createProxyMiddleware({
     target: TARGET,
     changeOrigin: true,
-    selfHandleResponse: true,
+    selfHandleResponse: true, // Crucial for our streaming/rewriting
     ws: true,
     secure: false,
     cookieDomainRewrite: "*",
     
     on: {
         proxyReq: (proxyReq, req, res) => {
-            // Request compression (gzip/br) to speed things up
-            // We will decompress it manually in proxyRes
+            // Support compression
             proxyReq.setHeader('Accept-Encoding', 'gzip, deflate, br');
             
+            // Standard Spoofing
             proxyReq.setHeader('Host', 'chatgpt.com');
             proxyReq.setHeader('Origin', 'https://chatgpt.com');
             proxyReq.setHeader('Referer', 'https://chatgpt.com/');
-            proxyReq.setHeader('User-Agent', MY_USER_AGENT);
+            
+            // INJECT ALL COOKIES
             proxyReq.setHeader('Cookie', MY_COOKIE);
+
+            // ANTI-DETECTION: Forced Consistency
+            proxyReq.setHeader('User-Agent', MY_USER_AGENT);
+            proxyReq.setHeader('sec-ch-ua', '"Google Chrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"');
+            proxyReq.setHeader('sec-ch-ua-mobile', '?0');
+            proxyReq.setHeader('sec-ch-ua-platform', '"Windows"');
         },
 
         proxyReqWs: (proxyReq, req, socket, options, head) => {
             proxyReq.setHeader('Host', 'chatgpt.com');
             proxyReq.setHeader('Origin', 'https://chatgpt.com');
-            proxyReq.setHeader('User-Agent', MY_USER_AGENT);
             proxyReq.setHeader('Cookie', MY_COOKIE);
+            proxyReq.setHeader('User-Agent', MY_USER_AGENT);
             console.log(`[WS] WebSocket Connected`);
         },
 
         proxyRes: (proxyRes, req, res) => {
             res.statusCode = proxyRes.statusCode;
 
-            // 1. STRIP HEADERS
+            // 1. STRIP SECURITY HEADERS
             Object.keys(proxyRes.headers).forEach(key => {
                 const k = key.toLowerCase();
                 if (
                     k !== 'content-security-policy' && 
                     k !== 'content-security-policy-report-only' &&
                     k !== 'strict-transport-security' && 
-                    k !== 'content-encoding' && // We handle decoding manually
+                    k !== 'content-encoding' && 
                     k !== 'content-length' &&
                     k !== 'transfer-encoding' &&
                     k !== 'set-cookie'
@@ -96,7 +100,7 @@ const proxyMiddleware = createProxyMiddleware({
                 }
             });
 
-            // 2. COOKIE FIX
+            // 2. COOKIE REWRITE (For Browser Support)
             if (proxyRes.headers['set-cookie']) {
                 const cookies = proxyRes.headers['set-cookie'].map(c => {
                     let newCookie = c.replace(/; Domain=[^;]+/, '');
@@ -110,7 +114,7 @@ const proxyMiddleware = createProxyMiddleware({
             res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
             res.setHeader('Access-Control-Allow-Credentials', 'true');
 
-            // --- DECOMPRESSION SETUP ---
+            // --- DECOMPRESSION ---
             const encoding = proxyRes.headers['content-encoding'];
             const contentType = proxyRes.headers['content-type'] || '';
             
@@ -119,34 +123,24 @@ const proxyMiddleware = createProxyMiddleware({
             else if (encoding === 'br') decompressStream = zlib.createBrotliDecompress();
             else if (encoding === 'deflate') decompressStream = zlib.createInflate();
             
-            // --- DECISION: STREAM OR BUFFER? ---
-            
-            // A. STREAMING MODE (For Chat Response)
-            // 'text/event-stream' is used by ChatGPT to type out answers.
-            // We use a Pipe to send data INSTANTLY as it arrives.
+            // --- STREAMING MODE (FAST CHAT) ---
             if (contentType.includes('text/event-stream')) {
-                
                 const rewriteStream = new Transform({
                     transform(chunk, encoding, callback) {
-                        // Rewrite the chunk immediately
-                        const modifiedChunk = replaceUrls(chunk.toString());
-                        this.push(modifiedChunk);
+                        this.push(replaceUrls(chunk.toString()));
                         callback();
                     }
                 });
 
                 if (decompressStream) {
                     proxyRes.pipe(decompressStream).pipe(rewriteStream).pipe(res);
-                    decompressStream.on('error', (e) => { console.error('Zip Error', e); res.end(); });
                 } else {
                     proxyRes.pipe(rewriteStream).pipe(res);
                 }
             } 
             
-            // B. BUFFER MODE (For HTML, JS, JSON)
-            // We wait for the full file to ensure we don't break JSON syntax during rewrite
+            // --- BUFFER MODE (HTML / JS / JSON) ---
             else if (contentType.includes('text') || contentType.includes('javascript') || contentType.includes('json')) {
-                
                 let chunks = [];
                 const source = decompressStream ? proxyRes.pipe(decompressStream) : proxyRes;
 
@@ -154,18 +148,14 @@ const proxyMiddleware = createProxyMiddleware({
                 source.on('end', () => {
                     try {
                         const body = Buffer.concat(chunks).toString('utf8');
-                        const newBody = replaceUrls(body); // <--- This runs your REQUIRED rewrites
-                        res.end(newBody);
+                        res.end(replaceUrls(body));
                     } catch (e) {
-                        console.error('Buffer Error:', e);
                         res.end(); 
                     }
                 });
-                source.on('error', (e) => { console.error('Source Error:', e); res.end(); });
             } 
             
-            // C. BINARY MODE (Images, Fonts)
-            // Pass through raw
+            // --- BINARY MODE ---
             else {
                 proxyRes.pipe(res);
             }
@@ -179,17 +169,15 @@ const proxyMiddleware = createProxyMiddleware({
 
 app.use('/', proxyMiddleware);
 
-// --- LOAD CERTIFICATES AND START HTTPS SERVER ---
+// --- START SERVER ---
 try {
     const httpsOptions = {
         key: fs.readFileSync('./key.pem'),
         cert: fs.readFileSync('./cert.pem')
     };
-
     https.createServer(httpsOptions, app).listen(3000, '0.0.0.0', () => {
-        console.log(`HTTPS Server Ready! https://192.168.10.42:3000`);
+        console.log(`HTTPS Server Ready! ${MY_PROXY_URL}`);
     });
 } catch (error) {
-    console.error("FAILED TO LOAD CERTIFICATES. Did you run step 1?");
-    console.error(error.message);
+    console.error("CERT ERROR: Check key.pem and cert.pem");
 }
