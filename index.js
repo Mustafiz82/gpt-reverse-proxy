@@ -5,6 +5,9 @@ import dotenv from 'dotenv';
 import zlib from 'zlib';
 import https from 'https';
 import fs from 'fs';
+import { readFile } from "fs/promises";
+import path from "path";
+import { fileURLToPath } from "url";
 import { Transform } from 'stream'; 
 
 dotenv.config();
@@ -15,7 +18,30 @@ const TARGET = 'https://chatgpt.com';
 // Configuration from .env
 const MY_IP = process.env.MY_IP || '192.168.10.42';
 const MY_PROXY_URL = `https://${MY_IP}:3000`; 
-const MY_COOKIE = process.env.CHATGPT_COOKIES;
+const MY_COOKIEEnv = process.env.CHATGPT_COOKIES;
+console.log(MY_COOKIEEnv)
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+function cookiesArrayToHeader(cookies) {
+  return cookies
+    .filter(c => c.name && c.value)
+    .map(c => `${c.name}=${c.value}`)
+    .join("; ");
+}
+
+async function cookiesFileToHeader(filePath) {
+  const data = await readFile(filePath, "utf8");
+  const cookies = JSON.parse(data);
+  return cookiesArrayToHeader(cookies);
+}
+
+// usage
+const cookiesPath = path.join(__dirname, "cookies.json");
+const MY_COOKIE = await cookiesFileToHeader(cookiesPath);
+
+console.log(MY_COOKIE)
 
 // Consistency: This must match the browser you took the cookies from
 const MY_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36';
